@@ -10,6 +10,201 @@ Fork of [ai-forever/Real-ESRGAN](https://github.com/ai-forever/Real-ESRGAN) (sim
 - [Original implementation (xinntao)](https://github.com/xinntao/Real-ESRGAN)
 - [HuggingFace weights](https://huggingface.co/sberbank-ai/Real-ESRGAN)
 
+## Quick Start
+
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Run full benchmark (semua weights, semua dataset aktif)
+python main_computation.py
+
+# 3. Atau jalankan simple inference saja
+python main.py
+```
+
+## How to Run (Step by Step)
+
+### Langkah 1: Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+Butuh CUDA 11.8. Jika CUDA berbeda, ganti versi torch di `requirements.txt`.
+
+### Langkah 2: Siapkan Weight File (.pth)
+
+Taruh file `.pth` di folder `weights/`. Aturan penamaan:
+
+```
+weights/
+├── NamaModel_x4.pth          ← Scale harus ada di nama file: _x2, _x4, atau _x8
+├── RealESRGAN_default_x4.pth ← Contoh yang sudah ada
+├── MyCustomModel_x4.pth      ← Contoh custom weight
+└── 1disabled_x4.pth          ← Prefix "1" = dilewati (tidak diproses)
+```
+
+**Aturan nama file weight:**
+- Harus berakhiran `.pth`
+- Harus mengandung `_x2`, `_x4`, atau `_x8` (script extract scale dari sini via regex `_x(\d+)`)
+- Nama yang diawali `1` akan di-skip oleh `main_computation.py`
+- Contoh valid: `experiment_33_x4.pth`, `ConvNeXt_model_x4.pth`, `RealESRGAN_default_x2.pth`
+- Contoh invalid: `model.pth` (tidak ada scale), `model_4x.pth` (format salah)
+
+### Langkah 3: Format File .pth
+
+File `.pth` adalah PyTorch state dict untuk arsitektur **RRDBNet** (702-704 keys). Script mendukung 3 format:
+
+**Format 1: Raw OrderedDict (langsung state_dict)** -- yang dipakai di project ini
+```python
+# File .pth langsung berisi state_dict
+torch.save(model.state_dict(), 'weights/my_model_x4.pth')
+
+# Keys dimulai dengan:
+# conv_first.weight         torch.Size([64, 3, 3, 3])   ← x4/x8
+# conv_first.weight         torch.Size([64, 12, 3, 3])  ← x2 (pixel_unshuffle 3ch→12ch)
+# body.0.rdb1.conv1.weight  torch.Size([32, 64, 3, 3])
+# ...
+# conv_last.bias            torch.Size([3])
+```
+
+**Format 2: Wrapped dalam key `params`** -- format official xinntao Real-ESRGAN
+```python
+torch.save({'params': model.state_dict()}, 'weights/my_model_x4.pth')
+```
+
+**Format 3: Wrapped dalam key `params_ema`** -- EMA weights dari training
+```python
+torch.save({'params_ema': model.state_dict()}, 'weights/my_model_x4.pth')
+```
+
+**Detail state_dict keys per scale:**
+
+| Scale | `conv_first.weight` shape | Upsample layers | Total keys |
+|:-----:|:-------------------------:|:---------------:|:----------:|
+| x2    | `[64, 12, 3, 3]`         | conv_up1, conv_up2 | 702 |
+| x4    | `[64, 3, 3, 3]`          | conv_up1, conv_up2 | 702 |
+| x8    | `[64, 3, 3, 3]`          | conv_up1, conv_up2, conv_up3 | 704 |
+
+Perbedaan x2: input 3 channel di-pixel_unshuffle jadi 12 channel sebelum conv_first.
+Perbedaan x8: ada 3 upsample layer (bukan 2), sehingga 2 key lebih banyak.
+
+**Arsitektur harus match:** `RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32)`. Jika weight dari arsitektur berbeda (misal num_block=6), load akan gagal (`strict=True`).
+
+### Langkah 4: Siapkan Dataset
+
+Dataset ditaruh di 2 tempat dengan **nama folder dan nama file yang harus sama persis**:
+
+```
+inputs/
+├── lr/                              ← Low-resolution images (INPUT)
+│   └── NamaDataset/                 ← Nama folder = nama dataset
+│       └── 4/                       ← Subfolder = scale factor
+│           ├── img_001.png
+│           ├── img_002.png
+│           └── ...
+│
+└── gt/                              ← Ground truth / high-res images (REFERENSI)
+    └── NamaDataset/                 ← HARUS SAMA dengan nama di lr/
+        └── 4/                       ← HARUS SAMA scale factor
+            ├── img_001.png          ← HARUS SAMA nama file
+            ├── img_002.png
+            └── ...
+```
+
+**Aturan kritis:**
+- Nama folder dataset di `lr/` dan `gt/` **harus identik** (case-sensitive)
+- Nama file gambar di `lr/` dan `gt/` **harus identik** (misal `img_001.png`)
+- Subfolder angka (`2/`, `3/`, `4/`) menunjukkan scale factor
+- Format gambar: `.png`, `.jpg`, `.jpeg`
+- Folder di `lr/` yang diawali `1` akan di-skip (mekanisme disable)
+
+**Contoh yang sudah ada:**
+
+```
+inputs/lr/Set5/4/img_001.png    ←→    inputs/gt/Set5/4/img_001.png
+inputs/lr/Set5/4/img_002.png    ←→    inputs/gt/Set5/4/img_002.png
+```
+
+**Cara menambahkan dataset baru:**
+```bash
+# Contoh: tambahkan dataset "Manga109" untuk scale x4
+mkdir -p inputs/lr/Manga109/4
+mkdir -p inputs/gt/Manga109/4
+
+# Copy LR images ke inputs/lr/Manga109/4/
+# Copy HR (ground truth) images ke inputs/gt/Manga109/4/
+# Pastikan nama file sama di kedua folder
+```
+
+**Cara disable dataset tanpa menghapus:**
+```bash
+# Rename folder dengan prefix "1"
+mv inputs/lr/Set5 inputs/lr/1Set5    # Set5 sekarang di-skip
+mv inputs/lr/1Set5 inputs/lr/Set5    # Aktifkan kembali
+```
+
+### Langkah 5: Jalankan Script
+
+**Script utama: `main_computation.py`** (untuk benchmark lengkap)
+
+```bash
+python main_computation.py
+```
+
+Apa yang terjadi:
+1. Print info CUDA/PyTorch
+2. Scan `weights/` → ambil semua `.pth` yang tidak berawalan `1`
+3. Untuk setiap weight file:
+   - Extract scale dari nama file (regex `_x(\d+)`)
+   - Load model ke GPU
+   - Proses setiap dataset aktif di `inputs/lr/`
+   - Untuk setiap gambar: super-resolve → simpan hasil → hitung PSNR vs ground truth
+   - Monitor CPU/RAM/GPU selama proses
+4. Output:
+   - Gambar hasil: `output/{weight_name}/{dataset}/{scale}/img_NNN.png`
+   - Log file: `output/{weight_name}/log_{weight_name}.log`
+
+Contoh log output:
+```
+Hitung Metriks Gambar:
+PSNR: 28.45
+
+Rata-rata penggunaan sistem selama proses:
+CPU: 15.23%
+RAM: 45.67% (7234.56 MB)
+GPU: 78.90%
+Memori GPU: 34.56% (2345.67 MB)
+Waktu total: 123.45 detik
+```
+
+**Script sederhana: `main.py`** (untuk coba cepat)
+
+```bash
+python main.py
+```
+
+Hardcoded scale=2 dan weight `weights/RealESRGAN_x2.pth`. Memproses semua gambar langsung di folder `inputs/` (bukan subfolder dataset). Output ke `results/`.
+
+### Contoh: Evaluasi Custom Weight dari DCS Research
+
+```bash
+# 1. Copy weight hasil training dari experiment (misal Eksperimen-33)
+cp /path/to/experiment/net_g_100000.pth weights/experiment_33_x4.pth
+
+# 2. Pastikan dataset aktif (hapus prefix "1" jika perlu)
+mv inputs/lr/1BSD100 inputs/lr/BSD100
+mv inputs/lr/1Set14 inputs/lr/Set14
+mv inputs/lr/1Urban100 inputs/lr/Urban100
+
+# 3. Jalankan benchmark
+python main_computation.py
+
+# 4. Lihat hasil
+cat output/experiment_33_x4/log_experiment_33_x4.log
+```
+
 ## What This Project Does
 
 1. **Super-resolve** low-resolution images using pretrained RRDBNet generator (x2, x4, x8)
