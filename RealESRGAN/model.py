@@ -45,14 +45,67 @@ class RealESRGAN:
             print('Weights downloaded to:', os.path.join(cache_dir, local_filename))
         
         loadnet = torch.load(model_path, weights_only=True)
+        
+        # Auto-detect architecture from weight file
         if 'params' in loadnet:
-            self.model.load_state_dict(loadnet['params'], strict=True)
+            state_dict = loadnet['params']
         elif 'params_ema' in loadnet:
-            self.model.load_state_dict(loadnet['params_ema'], strict=True)
+            state_dict = loadnet['params_ema']
         else:
-            self.model.load_state_dict(loadnet, strict=True)
+            state_dict = loadnet
+            
+        # Detect architecture from weight shapes
+        num_feat, num_block, num_grow_ch = self._detect_architecture(state_dict)
+        
+        # Recreate model with detected architecture
+        self.model = RRDBNet(
+            num_in_ch=3, num_out_ch=3, num_feat=num_feat,
+            num_block=num_block, num_grow_ch=num_grow_ch, scale=self.scale
+        )
+        
+        self.model.load_state_dict(state_dict, strict=True)
         self.model.eval()
         self.model.to(self.device)
+        
+    def _detect_architecture(self, state_dict):
+        # Default values
+        num_feat = 64
+        num_block = 23  
+        num_grow_ch = 32
+        
+        # Debug: print first 10 keys to see structure
+        print("Weight file keys (first 10):")
+        for i, key in enumerate(list(state_dict.keys())[:10]):
+            print(f"  {key}: {state_dict[key].shape}")
+        
+        # Count RRDB blocks by looking for 'body.' layers
+        block_keys = [k for k in state_dict.keys() if k.startswith('body.') and '.RDB' in k]
+        print(f"Found {len(block_keys)} block keys")
+        
+        if block_keys:
+            block_indices = set()
+            for key in block_keys:
+                parts = key.split('.')
+                if len(parts) > 1 and parts[1].isdigit():
+                    block_indices.add(int(parts[1]))
+            if block_indices:
+                num_block = max(block_indices) + 1
+                print(f"Detected num_block: {num_block}")
+        
+        # Detect num_feat from conv_first weight shape
+        if 'conv_first.weight' in state_dict:
+            num_feat = state_dict['conv_first.weight'].shape[0]
+            print(f"Detected num_feat from conv_first: {num_feat}")
+            
+        # Detect num_grow_ch from first RDB layer
+        for key in state_dict.keys():
+            if '.RDB1.conv1.0.weight' in key:
+                num_grow_ch = state_dict[key].shape[0]
+                print(f"Detected num_grow_ch: {num_grow_ch}")
+                break
+                
+        print(f"Final architecture: num_feat={num_feat}, num_block={num_block}, num_grow_ch={num_grow_ch}")
+        return num_feat, num_block, num_grow_ch
         
     @torch.cuda.amp.autocast(enabled=True)
     def predict(self, lr_image, batch_size=4, patches_size=192,

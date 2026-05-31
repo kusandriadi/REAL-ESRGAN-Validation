@@ -10,3 +10,4 @@ line_profiler
 memory_profiler
 tensorflow
 tensorflow_datasets
+pyiqa==0.1.13
