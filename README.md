@@ -12,7 +12,26 @@ Fork of [ai-forever/Real-ESRGAN](https://github.com/ai-forever/Real-ESRGAN) (sim
 
 ---
 
-## TL;DR — How to Run
+## Contents
+
+1. [How to run (TL;DR)](#tldr-how-to-run)
+2. [Where the `.pth` weights go + naming format](#1-where-the-pth-weights-go-and-naming-format)
+3. [Inputs — `lr` / `gt` layout](#2-inputs-what-they-are-and-how-to-name-them)
+4. [Outputs — structure & log naming](#3-outputs-structure-and-naming)
+5. [The four scripts & how they differ](#4-the-four-scripts-what-each-does-and-how-they-differ)
+   - [`basic` vs `custom`](#basic-vs-custom-the-real-difference)
+6. [What this project does](#what-this-project-does)
+7. [Project structure](#project-structure)
+8. [Generator architecture: RRDBNet](#generator-architecture-rrdbnet)
+9. [Metrics](#metrics)
+10. [Dependencies](#dependencies)
+11. [Example: evaluate a custom weight](#example-evaluate-a-custom-trained-weight)
+12. [What is NOT included](#what-is-not-in-this-project)
+13. [Relationship to the DCS research](#relationship-to-the-dcs-research)
+
+---
+
+## TL;DR: How to Run
 
 All paths in the scripts are **relative**, so you must run from the project root.
 
@@ -38,7 +57,7 @@ What the batch scripts need on disk:
 
 ---
 
-## 1. Where the `.pth` weights go + naming format
+## 1. Where the `.pth` weights go and naming format
 
 Put every weight file in `weights/`.
 
@@ -75,7 +94,7 @@ If a requested weight file is missing **and** `download=True`, the default Sberb
 
 ---
 
-## 2. Inputs — what they are and how to name them
+## 2. Inputs: what they are and how to name them
 
 Two parallel trees under `inputs/`, one for the LR input and one for the HR ground truth:
 
@@ -114,7 +133,7 @@ New-Item -ItemType Directory -Force inputs\gt\Manga109\4
 
 ---
 
-## 3. Outputs — structure and naming
+## 3. Outputs: structure and naming
 
 ### Batch scripts (`evaluate_basic.py` and `evaluate_custom.py`)
 
@@ -189,7 +208,7 @@ Average time per image: 4.04 seconds
 
 ---
 
-## 4. The four scripts — what each does and how they differ
+## 4. The four scripts: what each does and how they differ
 
 | Script | Scope | Metrics | Stats reported | Notes |
 |---|---|---|---|---|
@@ -198,7 +217,7 @@ Average time per image: 4.04 seconds
 | **`simple_upscale.py`** | **Single image** | same 5 (if GT given) | per-image values | Hardcoded example paths in `main()` — **edit them first** (the defaults point to an example that may not exist). Also exposes `upscale_and_evaluate()` to import. |
 | **`main.py`** | Folder of images (flat `inputs/`) | none | — | Minimal legacy demo. Hardcoded `scale=2`, weight `RealESRGAN_x2.pth`, `download=True`. Saves to `results/`. Not part of the benchmark. |
 
-### `basic` vs `custom` — the real difference
+### `basic` vs `custom`: the real difference
 
 Both run the **same models on the same datasets** and both compute metrics **per image, then average** (they are *not* "aggregate vs per-image"). The differences are in *reporting and bookkeeping*:
 
