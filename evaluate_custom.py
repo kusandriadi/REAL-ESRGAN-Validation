@@ -218,7 +218,7 @@ def main() -> int:
     version.printVersion()
     start_time = time.time()
     
-    print("RealESRGAN Image Upscaling with Metrics v2")
+    print("RealESRGAN Evaluation - custom (mean +/- std, min/max)")
     print("=" * 60)
     
     # Get available weight files (exclude files starting with '1')

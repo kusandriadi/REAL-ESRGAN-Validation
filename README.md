@@ -1,416 +1,351 @@
-# Real-ESRGAN (Inference & Evaluation)
+# REAL-ESRGAN-Validation (Inference & Evaluation)
 
 Inference and benchmarking pipeline for Real-ESRGAN super-resolution models.
-Fork of [ai-forever/Real-ESRGAN](https://github.com/ai-forever/Real-ESRGAN) (simplified Sberbank AI implementation), with custom evaluation tools.
+Fork of [ai-forever/Real-ESRGAN](https://github.com/ai-forever/Real-ESRGAN) (simplified Sberbank AI implementation), with custom evaluation tools used to validate the trained generators from the DCS research.
 
 > This is NOT the official [xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN).
-> This codebase is **inference-only** -- no training code, no discriminator, no GAN training pipeline.
+> This codebase is **inference-only** — no training code, no discriminator, no GAN training pipeline. It loads a trained generator (`.pth`), upscales images, and measures quality.
 
 - [Paper: Real-ESRGAN (Wang et al., 2021)](https://arxiv.org/abs/2107.10833)
 - [Original implementation (xinntao)](https://github.com/xinntao/Real-ESRGAN)
 - [HuggingFace weights](https://huggingface.co/sberbank-ai/Real-ESRGAN)
 
-## Quick Start
+---
 
-```bash
-# 1. Install dependencies
-pip install -r requirements.txt
+## TL;DR — How to Run
 
-# 2. Run full benchmark (semua weights, semua dataset aktif)
-python main_computation.py
+All paths in the scripts are **relative**, so you must run from the project root.
 
-# 3. Atau jalankan simple inference saja
-python main.py
+```powershell
+cd C:\Users\kusan\Documents\code\self\s3\REAL-ESRGAN-Validation
+.\.venv\Scripts\Activate.ps1          # activate the virtual env
+# or: pip install -r requirements.txt  (needs CUDA 11.8)
+
+python evaluate_basic.py              # full benchmark  -> "basic"  results
+python evaluate_custom.py             # full benchmark  -> "custom" results (richer stats)
+python simple_upscale.py              # one image + 5 metrics (edit paths inside first)
+python main.py                        # minimal upscale demo, no metrics
 ```
 
-## How to Run (Step by Step)
+What the batch scripts need on disk:
 
-### Langkah 1: Install Dependencies
+| Folder | Purpose |
+|---|---|
+| `weights/*.pth` | trained generator weights to evaluate |
+| `inputs/lr/<Dataset>/<scale>/*.png` | low-resolution **input** images |
+| `inputs/gt/<Dataset>/<scale>/*.png` | high-resolution **ground truth** (required for metrics) |
+| `output/` | created automatically; results + logs land here |
 
-```bash
-pip install -r requirements.txt
-```
+---
 
-Butuh CUDA 11.8. Jika CUDA berbeda, ganti versi torch di `requirements.txt`.
+## 1. Where the `.pth` weights go + naming format
 
-### Langkah 2: Siapkan Weight File (.pth)
-
-Taruh file `.pth` di folder `weights/`. Aturan penamaan:
+Put every weight file in `weights/`.
 
 ```
 weights/
-├── NamaModel_x4.pth          ← Scale harus ada di nama file: _x2, _x4, atau _x8
-├── RealESRGAN_default_x4.pth ← Contoh yang sudah ada
-├── MyCustomModel_x4.pth      ← Contoh custom weight
-└── 1disabled_x4.pth          ← Prefix "1" = dilewati (tidak diproses)
+├── RealESRGAN_29_5-DEFAULT_x4.pth     ← will be processed (no "1" prefix)
+├── 1RealESRGAN_33_ConvNext_..._x4.pth ← SKIPPED ("1" prefix = disabled)
+└── MyModel_x4.pth                     ← any name works if it ends _x4 / _x2 / _x8
 ```
 
-**Aturan nama file weight:**
-- Harus berakhiran `.pth`
-- Harus mengandung `_x2`, `_x4`, atau `_x8` (script extract scale dari sini via regex `_x(\d+)`)
-- Nama yang diawali `1` akan di-skip oleh `main_computation.py`
-- Contoh valid: `experiment_33_x4.pth`, `ConvNeXt_model_x4.pth`, `RealESRGAN_default_x2.pth`
-- Contoh invalid: `model.pth` (tidak ada scale), `model_4x.pth` (format salah)
+**Naming rules (enforced by the batch scripts):**
 
-### Langkah 3: Format File .pth
+- Must end with `.pth`.
+- Must contain the scale token `_x2`, `_x4`, or `_x8` — the scale is parsed from the filename via regex `_x(\d+)`. A file without it is skipped with a warning.
+- **A filename starting with `1` is skipped.** This is the "disable / archive" switch — rename to add/remove the leading `1` to turn a weight off/on without deleting it.
+- Valid: `experiment_33_x4.pth`, `ConvNeXt_model_x4.pth`, `RealESRGAN_default_x2.pth`
+- Invalid: `model.pth` (no scale), `model_4x.pth` (wrong format → skipped).
 
-File `.pth` adalah PyTorch state dict untuk arsitektur **RRDBNet** (702-704 keys). Script mendukung 3 format:
+> **Current state of this repo:** `weights/` holds 23 files, but **22 are prefixed `1`** (archived) and only **`RealESRGAN_29_5-DEFAULT_x4.pth`** is active. So a batch run right now evaluates just that one model. Remove the `1` prefix from any file you also want evaluated. (Weight `.pth` files are git-ignored — they live on disk only, not in the repo.)
 
-**Format 1: Raw OrderedDict (langsung state_dict)** -- yang dipakai di project ini
-```python
-# File .pth langsung berisi state_dict
-torch.save(model.state_dict(), 'weights/my_model_x4.pth')
+### `.pth` content / format
 
-# Keys dimulai dengan:
-# conv_first.weight         torch.Size([64, 3, 3, 3])   ← x4/x8
-# conv_first.weight         torch.Size([64, 12, 3, 3])  ← x2 (pixel_unshuffle 3ch→12ch)
-# body.0.rdb1.conv1.weight  torch.Size([32, 64, 3, 3])
-# ...
-# conv_last.bias            torch.Size([3])
-```
+A weight file is a PyTorch state dict for the **RRDBNet** generator. Three layouts are accepted automatically (`model.py`):
 
-**Format 2: Wrapped dalam key `params`** -- format official xinntao Real-ESRGAN
-```python
-torch.save({'params': model.state_dict()}, 'weights/my_model_x4.pth')
-```
+| Layout | How it was saved |
+|---|---|
+| Raw state dict | `torch.save(model.state_dict(), ...)` |
+| `{'params': ...}` | official xinntao Real-ESRGAN format |
+| `{'params_ema': ...}` | EMA weights from training |
 
-**Format 3: Wrapped dalam key `params_ema`** -- EMA weights dari training
-```python
-torch.save({'params_ema': model.state_dict()}, 'weights/my_model_x4.pth')
-```
+The architecture (`num_feat`, `num_block`, `num_grow_ch`) is **auto-detected from the weight shapes** at load time, so non-standard generators load too — you do **not** have to hand-match `num_block=23`. Loading is `strict=True` after detection, so a genuinely incompatible file still fails loudly.
 
-**Detail state_dict keys per scale:**
+If a requested weight file is missing **and** `download=True`, the default Sberbank weights for scale 2/4/8 are pulled from HuggingFace Hub (`sberbank-ai/Real-ESRGAN`). The batch scripts call with `download=False`; only `main.py` uses `download=True`.
 
-| Scale | `conv_first.weight` shape | Upsample layers | Total keys |
-|:-----:|:-------------------------:|:---------------:|:----------:|
-| x2    | `[64, 12, 3, 3]`         | conv_up1, conv_up2 | 702 |
-| x4    | `[64, 3, 3, 3]`          | conv_up1, conv_up2 | 702 |
-| x8    | `[64, 3, 3, 3]`          | conv_up1, conv_up2, conv_up3 | 704 |
+---
 
-Perbedaan x2: input 3 channel di-pixel_unshuffle jadi 12 channel sebelum conv_first.
-Perbedaan x8: ada 3 upsample layer (bukan 2), sehingga 2 key lebih banyak.
+## 2. Inputs — what they are and how to name them
 
-**Arsitektur harus match:** `RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32)`. Jika weight dari arsitektur berbeda (misal num_block=6), load akan gagal (`strict=True`).
-
-### Langkah 4: Siapkan Dataset
-
-Dataset ditaruh di 2 tempat dengan **nama folder dan nama file yang harus sama persis**:
+Two parallel trees under `inputs/`, one for the LR input and one for the HR ground truth:
 
 ```
 inputs/
-├── lr/                              ← Low-resolution images (INPUT)
-│   └── NamaDataset/                 ← Nama folder = nama dataset
-│       └── 4/                       ← Subfolder = scale factor
+├── lr/                      ← low-resolution INPUT images
+│   └── <Dataset>/           ← dataset name, e.g. Set5, BSD100
+│       └── <scale>/         ← scale factor as a plain number: 2, 3, or 4
 │           ├── img_001.png
-│           ├── img_002.png
 │           └── ...
-│
-└── gt/                              ← Ground truth / high-res images (REFERENSI)
-    └── NamaDataset/                 ← HARUS SAMA dengan nama di lr/
-        └── 4/                       ← HARUS SAMA scale factor
-            ├── img_001.png          ← HARUS SAMA nama file
-            ├── img_002.png
+└── gt/                      ← ground-truth / high-res REFERENCE images
+    └── <Dataset>/           ← MUST match the name under lr/
+        └── <scale>/         ← MUST match the scale folder under lr/
+            ├── img_001.png  ← MUST match the filename under lr/
             └── ...
 ```
 
-**Aturan kritis:**
-- Nama folder dataset di `lr/` dan `gt/` **harus identik** (case-sensitive)
-- Nama file gambar di `lr/` dan `gt/` **harus identik** (misal `img_001.png`)
-- Subfolder angka (`2/`, `3/`, `4/`) menunjukkan scale factor
-- Format gambar: `.png`, `.jpg`, `.jpeg`
-- Folder di `lr/` yang diawali `1` akan di-skip (mekanisme disable)
+**Critical matching rules:**
 
-**Contoh yang sudah ada:**
+- Dataset folder names in `lr/` and `gt/` must be **identical** (case-sensitive).
+- The scale subfolder is a **plain number** (`2`, `3`, `4`) — *not* `2x`.
+- Each LR image must have a **same-named** GT image at the same dataset/scale path. Metrics for an image are skipped (basic) / that image is dropped (custom) if its GT is missing.
+- Accepted formats: `.png`, `.jpg`, `.jpeg`.
+- A dataset folder under `lr/` starting with `1` is **skipped** (same disable convention as weights).
 
-```
-inputs/lr/Set5/4/img_001.png    ←→    inputs/gt/Set5/4/img_001.png
-inputs/lr/Set5/4/img_002.png    ←→    inputs/gt/Set5/4/img_002.png
-```
+Currently active datasets: **BSD100, Set5, Set14, Urban100** (each with `2/ 3/ 4/`, except Urban100 which has `2/ 4/`).
 
-**Cara menambahkan dataset baru:**
-```bash
-# Contoh: tambahkan dataset "Manga109" untuk scale x4
-mkdir -p inputs/lr/Manga109/4
-mkdir -p inputs/gt/Manga109/4
-
-# Copy LR images ke inputs/lr/Manga109/4/
-# Copy HR (ground truth) images ke inputs/gt/Manga109/4/
-# Pastikan nama file sama di kedua folder
+**Add a new dataset (e.g. Manga109, x4):**
+```powershell
+New-Item -ItemType Directory -Force inputs\lr\Manga109\4
+New-Item -ItemType Directory -Force inputs\gt\Manga109\4
+# copy LR images into inputs\lr\Manga109\4\  and matching HR into inputs\gt\Manga109\4\
 ```
 
-**Cara disable dataset tanpa menghapus:**
-```bash
-# Rename folder dengan prefix "1"
-mv inputs/lr/Set5 inputs/lr/1Set5    # Set5 sekarang di-skip
-mv inputs/lr/1Set5 inputs/lr/Set5    # Aktifkan kembali
+**Disable a dataset without deleting it:** rename with a leading `1` (e.g. `Set5` → `1Set5`); rename back to re-enable.
+
+---
+
+## 3. Outputs — structure and naming
+
+### Batch scripts (`evaluate_basic.py` and `evaluate_custom.py`)
+
+Results mirror the input tree under `output/`, one folder per weight:
+
+```
+output/
+└── <weight_name>/                         ← weight filename without ".pth"
+    └── <Dataset>/
+        └── <scale>/
+            ├── img_001.png                ← super-resolved result (same filename as input)
+            ├── img_002.png
+            └── log_<weight_name>_<Dataset>_<scale>.log   ← metrics + system usage
 ```
 
-### Langkah 5: Jalankan Script
+- `<weight_name>` = the `.pth` filename minus extension (e.g. `RealESRGAN_29_5-DEFAULT_x4`).
+- One **log per scale folder**, named `log_<weight>_<dataset>_<scale>.log`, written *inside* that scale folder.
 
-**Script utama: `main_computation.py`** (untuk benchmark lengkap)
+### Demo scripts
 
-```bash
-python main_computation.py
+| Script | Output |
+|---|---|
+| `main.py` | `results/<image>_result_<weight>_<scale>.png` (no metrics) |
+| `simple_upscale.py` | `output/simple_upscale/<name>_upscaled.png` + a `..._metrics.txt` next to it |
+
+### Log file contents
+
+**basic** (`evaluate_basic.py` → `RealESRGAN/process/upscale.py`) — averages only, Indonesian system labels:
 ```
+Model Parameters:
+Total parameters: 16,697,987
+Trainable parameters: 0
+Model size (calculated): 63.70 MB
+Weight file size: 127.85 MB
 
-Apa yang terjadi:
-1. Print info CUDA/PyTorch
-2. Scan `weights/` → ambil semua `.pth` yang tidak berawalan `1`
-3. Untuk setiap weight file:
-   - Extract scale dari nama file (regex `_x(\d+)`)
-   - Load model ke GPU
-   - Proses setiap dataset aktif di `inputs/lr/`
-   - Untuk setiap gambar: super-resolve → simpan hasil → hitung PSNR vs ground truth
-   - Monitor CPU/RAM/GPU selama proses
-4. Output:
-   - Gambar hasil: `output/{weight_name}/{dataset}/{scale}/img_NNN.png`
-   - Log file: `output/{weight_name}/log_{weight_name}.log`
-
-Contoh log output:
-```
-Hitung Metriks Gambar:
-PSNR: 28.45
+Image Quality Metrics:
+PSNR (HB): 23.74
+SSIM (HB): 0.6617
+PI   (LB): 2.7450
+NIQE (LB): 3.6848
+LPIPS (LB): 0.2718
 
 Rata-rata penggunaan sistem selama proses:
-CPU: 15.23%
-RAM: 45.67% (7234.56 MB)
-GPU: 78.90%
-Memori GPU: 34.56% (2345.67 MB)
-Waktu total: 123.45 detik
+CPU: 2.73%
+RAM: 73.74% (24046.24 MB)
+GPU: 29.83%
+Memori GPU: 95.00% (7778.58 MB)
+Waktu total: 6 minutes 44 seconds
 ```
 
-**Script sederhana: `main.py`** (untuk coba cepat)
+**custom** (`evaluate_custom.py`) — mean ± std with min/max, per-image timing, English labels:
+```
+Model Parameters:
+... (same block) ...
 
-```bash
-python main.py
+Image Quality Metrics (Average):
+Images processed: 100
+PSNR (HB): 22.33 +/- 2.59 dB (min: 16.85, max: 28.84)
+SSIM (HB): 0.5686 +/- 0.1273 (min: 0.2242, max: 0.8351)
+PI (LB): 2.6261 +/- 0.7378 (min: 1.6727, max: 6.2234)
+NIQE (LB): 3.3761 +/- 0.8383 (min: 2.3258, max: 8.2941)
+LPIPS (LB): 0.3242 +/- 0.0812 (min: 0.1620, max: 0.6743)
+
+System Performance (Average):
+CPU: 5.59%
+RAM: 76.83% (25053.29 MB)
+GPU: 19.49%
+GPU Memory: 95.93% (7855.00 MB)
+Total processing time: 6 minutes 43 seconds
+Average time per image: 4.04 seconds
 ```
 
-Hardcoded scale=2 dan weight `weights/RealESRGAN_x2.pth`. Memproses semua gambar langsung di folder `inputs/` (bukan subfolder dataset). Output ke `results/`.
+---
 
-### Contoh: Evaluasi Custom Weight dari DCS Research
+## 4. The four scripts — what each does and how they differ
 
-```bash
-# 1. Copy weight hasil training dari experiment (misal Eksperimen-33)
-cp /path/to/experiment/net_g_100000.pth weights/experiment_33_x4.pth
+| Script | Scope | Metrics | Stats reported | Notes |
+|---|---|---|---|---|
+| **`evaluate_basic.py`** (`basic`) | Batch: every active weight × every active dataset | PSNR, SSIM, PI, NIQE, LPIPS | **mean only** | Delegates to `RealESRGAN/process/upscale.py`. Indonesian log labels. **These results feed the dissertation.** |
+| **`evaluate_custom.py`** (`custom`) | Batch: same | same 5 | **mean ± std, min/max** + images processed + avg time/image | Self-contained (does not use `upscale.py`). English labels, per-model/per-dataset `try/except`, correct per-scale separation. |
+| **`simple_upscale.py`** | **Single image** | same 5 (if GT given) | per-image values | Hardcoded example paths in `main()` — **edit them first** (the defaults point to an example that may not exist). Also exposes `upscale_and_evaluate()` to import. |
+| **`main.py`** | Folder of images (flat `inputs/`) | none | — | Minimal legacy demo. Hardcoded `scale=2`, weight `RealESRGAN_x2.pth`, `download=True`. Saves to `results/`. Not part of the benchmark. |
 
-# 2. Pastikan dataset aktif (hapus prefix "1" jika perlu)
-mv inputs/lr/1BSD100 inputs/lr/BSD100
-mv inputs/lr/1Set14 inputs/lr/Set14
-mv inputs/lr/1Urban100 inputs/lr/Urban100
+### `basic` vs `custom` — the real difference
 
-# 3. Jalankan benchmark
-python main_computation.py
+Both run the **same models on the same datasets** and both compute metrics **per image, then average** (they are *not* "aggregate vs per-image"). The differences are in *reporting and bookkeeping*:
 
-# 4. Lihat hasil
-cat output/experiment_33_x4/log_experiment_33_x4.log
-```
+- **basic** reports only the mean; **custom** reports mean ± std (min/max), image count, and average time per image.
+- **custom** resets its accumulators per scale folder, so each scale log is scale-specific. **basic** accumulates one shared list across all scales of a dataset and writes that same cumulative average into every per-scale log of that dataset — a known quirk to be aware of when reading `basic` logs.
+- Because mean-of-per-image differs slightly from how each pipeline buckets values, per-dataset numbers can differ a little (e.g. BSD100/4x: basic 23.74 vs custom 22.33), while the global averages across all datasets/scales converge (e.g. model 29_DEFAULT ≈ 23.54 in both).
+
+> In the DCS research, the **`basic`** outputs are the ones reported in the dissertation and papers; `custom` is the secondary, more detailed pass.
+
+---
 
 ## What This Project Does
 
-1. **Super-resolve** low-resolution images using pretrained RRDBNet generator (x2, x4, x8)
-2. **Evaluate** image quality via PSNR against ground truth benchmarks (Set5, Set14, BSD100, Urban100)
-3. **Monitor** system resources (CPU, RAM, GPU) during inference
-4. **Log** all results to files for analysis
+1. **Super-resolve** low-resolution images with a pretrained RRDBNet generator (x2, x4, x8).
+2. **Evaluate** quality against ground truth using **PSNR, SSIM, PI, NIQE, LPIPS** (all via [`pyiqa`](https://github.com/chaofengc/IQA-PyTorch)).
+3. **Monitor** system resources (CPU, RAM, GPU, GPU memory) during inference.
+4. **Log** per-dataset/per-scale results to files for later analysis.
 
 ## Project Structure
 
 ```
-Real-ESRGAN/
-├── RealESRGAN/                        # Core inference package
-│   ├── __init__.py                    # Exports: RealESRGAN class
-│   ├── model.py                       # RealESRGAN class (load weights, predict)
-│   ├── rrdbnet_arch.py                # Generator: RRDBNet (ResidualDenseBlock, RRDB)
-│   ├── arch_utils.py                  # Utilities: init weights, pixel_unshuffle
-│   ├── utils.py                       # Image split/stitch for patch-based inference
+REAL-ESRGAN-Validation/
+├── RealESRGAN/                    # Core inference package
+│   ├── __init__.py                # Exports: RealESRGAN class
+│   ├── model.py                   # RealESRGAN: load_weights (auto-detect arch), predict
+│   ├── rrdbnet_arch.py            # Generator: RRDBNet (RRDB / ResidualDenseBlock)
+│   ├── arch_utils.py              # make_layer, pixel_unshuffle, init helpers
+│   ├── utils.py                   # patch split / stitch for tiled inference
 │   └── process/
-│       └── upscale.py                 # Batch upscale + PSNR evaluation per dataset
+│       └── upscale.py             # "basic" batch upscale + metrics (used by evaluate_basic.py)
 │
-├── metrics/                           # System & image quality metrics
-│   ├── computation.py                 # System monitoring orchestrator
-│   ├── cpu_and_ram.py                 # CPU/RAM via psutil
-│   ├── gpu.py                         # GPU via GPUtil
-│   └── psnr.py                        # PSNR via skimage (data_range=255)
+├── metrics/                       # Image-quality (pyiqa) + system monitoring
+│   ├── psnr.py  ssim.py  niqe.py  lpips.py  perceptual_index.py   # pyiqa metrics
+│   ├── computation.py             # monitor_system_metrics(), calculate_average_metrics()
+│   ├── cpu_and_ram.py             # CPU / RAM sampling
+│   └── gpu.py                     # GPU / GPU-memory sampling
 │
-├── weights/                           # Pretrained .pth model weights
-│   ├── RealESRGAN_default_x2.pth      # x2 upscale (~16.7M params)
-│   ├── RealESRGAN_default_x4.pth      # x4 upscale (~16.7M params)
-│   └── RealESRGAN_default_x8.pth      # x8 upscale (~16.7M params)
+├── weights/                       # *.pth generator weights (git-ignored; on disk only)
+├── inputs/
+│   ├── lr/<Dataset>/<scale>/*.png # low-res inputs
+│   └── gt/<Dataset>/<scale>/*.png # ground truth (same names as lr/)
+├── output/                        # generated results + logs (git-ignored)
 │
-├── inputs/                            # Test images
-│   ├── gt/                            # Ground truth (HR) images
-│   │   ├── BSD100/{2,3,4}/            # 100 images, 3 scale factors
-│   │   ├── Set5/{2,3,4}/             # 5 images, 3 scale factors
-│   │   ├── Set14/{2,3,4}/            # 14 images, 3 scale factors
-│   │   └── Urban100/{2,4}/           # 100 images, 2 scale factors
-│   ├── lr/                            # Low-resolution input images
-│   │   ├── Set5/{2,3,4}/             # Active (no "1" prefix)
-│   │   ├── 1BSD100/{2,3,4}/          # Disabled ("1" prefix = skipped)
-│   │   ├── 1Set14/{2,3,4}/           # Disabled
-│   │   └── 1Urban100/{2,4}/          # Disabled
-│   ├── lr_image.png                   # Demo images
-│   ├── lr_face.png
-│   └── lr_lion.png
-│
-├── main.py                            # Simple inference (single scale, inputs/ folder)
-├── main_computation.py                # Full benchmark (all weights, all datasets, metrics)
-├── version.py                         # Print CUDA/PyTorch version info
-├── setup.py                           # pip install package setup
-├── requirements.txt                   # Dependencies (PyTorch 2.5.1 + CUDA 11.8)
-└── LICENSE                            # BSD 3-Clause
+├── evaluate_basic.py              # batch "basic"  (mean-only logs)
+├── evaluate_custom.py             # batch "custom" (mean±std/min-max logs)
+├── simple_upscale.py              # single-image upscale + metrics
+├── main.py                        # minimal demo (no metrics)
+├── version.py                     # prints CUDA / PyTorch / Python versions
+├── setup.py  requirements.txt     # packaging + deps (PyTorch 2.5.1 + CUDA 11.8)
+└── LICENSE                        # BSD 3-Clause
 ```
 
-### "1" Prefix Convention
+### "1" prefix convention
 
-Files/folders starting with `1` are **skipped** by `main_computation.py`:
-- `1BSD100/` in `inputs/lr/` = dataset disabled (not processed)
-- `1some_weight.pth` in `weights/` = weight file disabled
+Anything starting with `1` is **skipped** by the batch scripts:
+- `1SomeWeight_x4.pth` in `weights/` → weight disabled.
+- `1BSD100/` in `inputs/lr/` → dataset disabled.
 
-Remove the `1` prefix to enable a dataset or weight.
+Rename to remove the `1` to enable it again.
 
 ## Generator Architecture: RRDBNet
 
-The only neural network in this codebase. Standard ESRGAN/Real-ESRGAN generator.
+The only neural network in this codebase — the standard ESRGAN/Real-ESRGAN generator.
 
 ```
 RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32)
 
-Pipeline:
-  Input (3ch RGB) ──► [pixel_unshuffle if scale≤2]
-    ──► conv_first (3→64)
-    ──► 23x RRDB blocks (each = 3x ResidualDenseBlock, each = 5 dense Conv2d)
-    ──► conv_body + global skip connection
-    ──► Upsample (nearest interp x2 + Conv2d) × N  [N=2 for x4, N=3 for x8]
-    ──► conv_hr + conv_last (64→3)
-  Output (3ch RGB, upscaled)
+  Input (3ch RGB) ──► [pixel_unshuffle if scale==2]
+    ──► conv_first
+    ──► 23× RRDB (each = 3× ResidualDenseBlock, each = 5 dense Conv2d)
+    ──► conv_body + global skip
+    ──► Upsample × N   (N=2 for x4, N=3 for x8)
+    ──► conv_hr ──► conv_last
+  Output (upscaled RGB)
 
-Total parameters: ~16.7M
-Activation: LeakyReLU(0.2)
-Residual scaling: 0.2 (at both RDB and RRDB levels)
-Weight init: Kaiming normal, scaled by 0.1
+~16.7M params · LeakyReLU(0.2) · residual scaling 0.2
 ```
 
-### ResidualDenseBlock (RDB)
-- 5 Conv2d layers (3x3) with dense connections (each receives concatenated features from all previous)
-- Growth channels: 32 per layer → input channels increase: 64, 96, 128, 160, 192
-- Final conv maps back to 64 channels + residual * 0.2
+Defaults above are the standard config; actual values are auto-detected per weight file at load.
 
-### RRDB
-- 3 sequential RDB blocks + residual * 0.2
-
-## Inference Pipeline
-
-### `model.predict(lr_image, batch_size=4, patches_size=192, padding=24, pad_size=15)`
+### Inference pipeline — `model.predict(lr, batch_size=4, patches_size=192, padding=24, pad_size=15)`
 
 ```
-PIL Image
-  ──► numpy array
-  ──► reflect-pad (15px all sides)
-  ──► split into 192x192 overlapping patches (24px overlap)
-  ──► normalize [0,1], to tensor, to GPU
-  ──► forward pass in batches of 4 (FP16 autocast, torch.no_grad)
-  ──► clamp [0,1]
-  ──► stitch patches back together
-  ──► unpad, convert to uint8 [0,255]
-  ──► PIL Image (SR result)
+PIL ─► numpy ─► reflect-pad 15px ─► split into 192×192 patches (24px overlap)
+   ─► normalize [0,1] ─► batched forward (FP16 autocast, no_grad)
+   ─► clamp [0,1] ─► stitch patches ─► unpad ─► uint8 ─► PIL (SR image)
 ```
-
-### Weight Loading
-
-Supports three state dict formats:
-- `loadnet['params']` (standard Real-ESRGAN format)
-- `loadnet['params_ema']` (EMA weights)
-- Raw state dict (direct)
-
-Can auto-download from HuggingFace Hub (`sberbank-ai/Real-ESRGAN`) for scales 2, 4, 8.
-
-## Entry Points
-
-### `main.py` -- Simple Inference
-
-```python
-# Hardcoded: scale=2, processes all images in inputs/
-python main.py
-# Output: results/
-```
-
-### `main_computation.py` -- Full Benchmark
-
-```python
-python main_computation.py
-```
-
-Loop logic:
-1. Scan `weights/` for all `.pth` not starting with `1`
-2. Extract scale from filename (`_x4` → scale=4)
-3. For each weight: load model, start system monitoring
-4. For each dataset in `inputs/lr/` not starting with `1`:
-   - For each scale subfolder → for each image:
-     - `model.predict()` → save result
-     - Calculate PSNR vs ground truth from `inputs/gt/`
-     - Collect CPU/RAM/GPU metrics
-5. Write log: avg PSNR, CPU%, RAM%, GPU%, GPU Memory%, total time
-
-Output: `output/{weight_name}/log_{weight_name}.log`
 
 ## Metrics
 
-| Metric | Source | Details |
-|--------|--------|---------|
-| **PSNR** | `metrics/psnr.py` | `skimage.metrics.peak_signal_noise_ratio`, data_range=255 |
-| **CPU %** | `metrics/cpu_and_ram.py` | `psutil.cpu_percent()` |
-| **RAM %/MB** | `metrics/cpu_and_ram.py` | `psutil.virtual_memory()` |
-| **GPU %** | `metrics/gpu.py` | `GPUtil.getGPUs()` |
-| **GPU Memory %/MB** | `metrics/gpu.py` | `GPUtil.getGPUs()` |
+| Metric | Backend | Direction |
+|---|---|---|
+| PSNR | `pyiqa` `psnr` | higher better |
+| SSIM | `pyiqa` `ssim` | higher better |
+| PI (Perceptual Index) | `pyiqa` `pi` | lower better |
+| NIQE | `pyiqa` `niqe` | lower better |
+| LPIPS | `pyiqa` `lpips` | lower better |
+| CPU / RAM / GPU / GPU-mem | `metrics/cpu_and_ram.py`, `metrics/gpu.py` | — |
 
-Note: Only PSNR is computed as an image quality metric. SSIM, NIQE, LPIPS, PI are NOT implemented here.
+All image-quality metrics take tensors of shape `(1, C, H, W)` in `[0, 1]`. PSNR/SSIM/LPIPS compare result vs ground truth; PI/NIQE are no-reference (computed on the result only).
 
 ## Dependencies
 
 ```
-torch==2.5.1+cu118          # PyTorch with CUDA 11.8
-torchvision==0.20.1+cu118
-torchaudio==2.5.1+cu118
-numpy, opencv-python, Pillow
-tqdm, huggingface-hub
-psutil, GPUtil              # System monitoring (imported in metrics/)
-skimage                     # PSNR calculation
-line_profiler, memory_profiler  # Profiling tools
-tensorflow, tensorflow_datasets # Not actively used in main pipeline
+torch==2.5.1+cu118  torchvision==0.20.1+cu118  torchaudio==2.5.1+cu118   # CUDA 11.8
+numpy  opencv-python  Pillow  tqdm  huggingface-hub
+pyiqa==0.1.13                          # PSNR/SSIM/PI/NIQE/LPIPS
+line_profiler  memory_profiler         # profiling
+tensorflow  tensorflow_datasets        # present in deps; not used by the main pipeline
 ```
 
-Install: `pip install -r requirements.txt`
+Install: `pip install -r requirements.txt` (needs CUDA 11.8 — change the torch wheels if your CUDA differs).
 
-## What is NOT in This Project
+## Example: evaluate a custom trained weight
 
-This is an inference-only fork. The following exist in the **official xinntao/Real-ESRGAN** but are absent here:
+```powershell
+# 1. Copy a trained generator and name it with the scale token
+Copy-Item ..\dcs-research\data\experiment\Eksperimen-33...\net_g.pth weights\experiment_33_x4.pth
 
-| Component | Present? | Notes |
-|-----------|:--------:|-------|
-| Generator (RRDBNet) | YES | Identical to official |
-| Discriminator architectures | NO | No UNetDiscriminatorSN, VGGStyleDiscriminator |
-| GAN training model | NO | No training loop, optimizer, scheduler |
-| Loss functions | NO | No L1, perceptual, GAN loss |
-| YAML config system | NO | No `options/` directory |
-| Training script | NO | No `train.py` |
-| Dataset/DataLoader | NO | No DIV2K loader, no degradation pipeline |
-| basicsr framework | NO | Standalone, no basicsr dependency |
-| Face restoration | NO | No GFPGAN/CodeFormer |
-| Video processing | NO | Image-only |
+# 2. Make sure it is NOT prefixed "1" (so it gets picked up), and datasets are enabled
+# 3. Run a benchmark
+python evaluate_basic.py              # or evaluate_custom.py for richer stats
 
-## Relationship to DCS Research
+# 4. Read a result log (per dataset / per scale)
+Get-Content output\experiment_33_x4\BSD100\4\log_experiment_33_x4_BSD100_4.log
+```
 
-This project is the **inference/evaluation tool** for the DCS research at BINUS University:
-- **Research project**: `C:\Users\kusan\Documents\kampus\dcs-research\`
-- **Training code** (discriminator architectures, experiment configs): in `dcs-research/data/code/` and `dcs-research/data/experiment/`
-- The `.pth` weight files here are the **pretrained default** Sberbank AI weights, NOT the custom-trained experiment weights from the DCS research
-- The DCS research trains custom discriminators (UNetDiscriminatorSN, ConvNeXtDiscriminator, etc.) using a different codebase (official xinntao Real-ESRGAN with basicsr), then evaluates the resulting generator weights
+## What is NOT in this project
 
-## Custom Modifications (vs ai-forever fork)
+Inference-only fork. Present in the **official xinntao/Real-ESRGAN** but absent here:
 
-1. **`main_computation.py`** -- Batch evaluation pipeline with multi-weight, multi-dataset loops + system monitoring
-2. **`metrics/` module** -- CPU/RAM/GPU monitoring + PSNR calculation (entirely custom)
-3. **`RealESRGAN/process/upscale.py`** -- Batch upscaling with GT comparison (custom)
-4. **`version.py`** -- Environment info printer (custom)
-5. **`requirements.txt`** -- Pinned to CUDA 11.8, added profiling tools
-6. **`model.py`** -- Added `weights_only=True` to `torch.load()` (security fix)
-7. **Benchmark datasets** -- `inputs/gt/` and `inputs/lr/` populated with Set5, Set14, BSD100, Urban100
+| Component | Present? |
+|---|:--:|
+| Generator (RRDBNet) | YES |
+| Discriminators (UNetSN, VGGStyle, …) | NO |
+| GAN training loop / optimizer / scheduler | NO |
+| Loss functions (L1, perceptual, GAN) | NO |
+| YAML config / `options/` | NO |
+| Training script, DIV2K loader, degradation | NO |
+| basicsr dependency | NO |
+| Face restoration / video | NO |
+
+## Relationship to the DCS research
+
+This is the **inference/validation tool** for the DCS research at BINUS University.
+
+- Research repo: `C:\Users\kusan\Documents\code\self\s3\dcs-research`
+- Training code & experiment configs (the custom discriminators — PatchGAN, ConvNeXt, NextSRGAN, the lightweight variants, etc.) live in `dcs-research/data/code/` and `dcs-research/data/experiment/`. Training uses a separate codebase (official xinntao Real-ESRGAN + basicsr).
+- The `.pth` files in `weights/` here are the **trained generators from those experiments** (e.g. `RealESRGAN_33_ConvNextDiscriminator_*`, `..._30_PatchGAN_*`), evaluated by the scripts above.
+- Aggregated metric tables and analysis derived from these runs are kept in `dcs-research/data/analysis/` (the `basic` pass is the one cited in the dissertation).

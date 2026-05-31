@@ -20,7 +20,7 @@ def main() -> int:
         if f.endswith('.pth') and not f.startswith('1')
     ]
 
-    print(f"RealESRGAN Image Upscaling with Progress Bars")
+    print(f"RealESRGAN Evaluation - basic (mean metrics)")
     print(f"Found {len(weight_files)} weight files to process")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
